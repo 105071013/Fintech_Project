@@ -12,4 +12,12 @@ stop。
 
 (3)	風險接受程度(高):以前 10 週的最低收盤價作為追蹤止損。
 
+程式碼
 
+CDDE1 -> 風險接受程度低
+
+CODE2 -> 風險接受程度中高
+
+CODE3 -> 風險接受程度高
+
+Dataset：StockPrice_set_2.xlsx、Benchmark.xlsx
