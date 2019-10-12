@@ -1,4 +1,4 @@
-# Fintech_Project
+# 以Trading Valley為基礎改建之理財機器人
 買入策略(Trend following)
 
 近 52 週最高價+squeeze 產生(布林通道跑進凱勒通道裡)+momentum>0 透過以上三個指標判斷股價將有一個往上漲的趨勢
