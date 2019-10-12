@@ -1,0 +1,358 @@
+import numpy as np
+import pandas as pd
+import scipy.stats as ss
+import datetime
+import time
+import math
+import matplotlib.pyplot as plt    #畫圖
+import seaborn as sns
+sns.set_style('whitegrid')
+% matplotlib inline
+
+from IPython.display import display
+# define function
+#Moving Average  
+def MA(df, n):  
+    MA = df.rolling(n).mean()
+    MA.columns = df.columns
+    return MA
+
+#根據價格的平均值加減兩倍標準差來當作通道的上下限
+#如果價格波動越大，標準差也就越大，當然通道就會越寬。
+#當價格走勢即將反轉偏向整理時，通道的區間也會比較小
+def BBANDS(df, n, multiple):  
+    MA = df.rolling(n).mean() 
+    MSD = df.rolling(n).std()
+    ub1 =  MA + multiple * MSD
+    uB1 = pd.DataFrame(ub1, index = df.index, columns = df.columns)  
+    lb1 =  MA - multiple * MSD
+    lB1 = pd.DataFrame(lb1, index = df.index, columns = df.columns)  
+    b2 = (df - MA + multiple * MSD) / (2 * multiple * MSD)  
+    B2 = pd.DataFrame(b2, index = df.index, columns = df.columns)  
+    BBAND = pd.concat([MA, uB1, lB1, B2], keys = ['Mean', 'UpperBand', 'LowerBand', '%B'], axis = 1)
+    return BBAND
+
+#從ATR的公式來看，如果股價在正常波動範圍內的時候，ATR的數值不會太大，只有當行情在短期內出現較多次的「跳空」時，
+#ATR值才會瞬間變大．所以只有當股巿下跌時ATR值才會變大，這表示巿場在股價上漲時，很少是以「跳空」的方式上漲的，
+#反而在下跌時卻有比較多的機會以「跳空」方式下跌．
+def ATR(df, n, H_price_name='High', L_price_name='Low', C_price_name='Close'):  
+    i = 0  
+    TR_l = [0]  
+    while i < len(df.index)-1:  
+        TR = max(df[H_price_name][i+1], df[C_price_name][i]) - min(df[L_price_name][i+1], df[C_price_name][i])  
+        TR_l.append(TR)  
+        i = i + 1  
+    TR_s = pd.Series(TR_l,index = df.index)  
+    ATR = pd.DataFrame(TR_s.ewm(span = n, min_periods = n).mean(), columns = ['ATR_%s' % n])
+    return ATR
+
+#Momentum  
+def MOM(df, n, C_price_name='Close'):  
+    M = pd.Series(df[C_price_name].diff(n), name = 'Momentum_' + str(n))    
+    return M
+
+#不同於布林通道,凱勒通道帶入了ATR (平均真實區間), 對於價格的波動反應會更加敏感
+def KELCH(df, n, std, H_price_name='High', L_price_name='Low', C_price_name='Close'):  
+    KelChM = pd.Series(df[C_price_name].rolling(n).mean())
+    ATR_value = ATR(df, n, H_price_name, L_price_name, C_price_name)['ATR_%s' % n]
+    KelChU = KelChM + std * ATR_value
+    KelChD = KelChM - std * ATR_value
+
+    KEL = pd.concat([KelChU, KelChM, KelChD], keys = ['KelChU', 'KelChM', 'KelChD'], axis = 1) 
+    return KEL
+
+ 
+def SQUEEZE(df, b_n, b_std, k_n, k_std, H_price_name='High', L_price_name='Low', C_price_name='Close'):  
+    
+    BBAND = BBANDS(df[[C_price_name]], b_n, b_std)
+    BBAND.columns = BBAND.columns.get_level_values(0)
+    UB_B = BBAND['UpperBand']
+    LB_B = BBAND['LowerBand']
+    
+    KEL = KELCH(df, k_n, k_std, H_price_name, L_price_name, C_price_name)
+    UB_K = KEL['KelChU']
+    LB_K = KEL['KelChD']
+    
+    check = pd.concat([BBAND, KEL], axis = 1)
+  
+    Signal = pd.DataFrame(((UB_B < UB_K) & (LB_B > LB_K)).astype(int), columns = ['squeeze'])
+    Signal['Momentum'] = MOM(df, k_n, C_price_name)
+
+    return Signal, check
+
+#RSI 越大，代表過去『漲的機率』越大
+#RSI 又被稱為『逆勢指標』->代表很多時候你要反著來(RSI過大->賣)
+def RSI(df, n, H_price_name='High', L_price_name='Low'):   
+    i = 0  
+    UpI = [0]  
+    DoI = [0]  
+    while i + 1 <= len(df.index)-1:  
+        UpMove = df[H_price_name][i + 1] - df[H_price_name][i]  
+        DoMove = df[L_price_name][i] - df[L_price_name][i+1]
+        if UpMove > DoMove and UpMove > 0:  
+            UpD = UpMove  
+        else: UpD = 0  
+        UpI.append(UpD)  
+        if DoMove > UpMove and DoMove > 0:  
+            DoD = DoMove  
+        else: DoD = 0  
+        DoI.append(DoD) 
+        i = i + 1  
+    UpI = pd.DataFrame(UpI,index = df.index)  
+    DoI = pd.DataFrame(DoI, index = df.index)  
+    PosDI = pd.DataFrame(UpI.ewm(span = n, min_periods = n - 1).mean())  
+    NegDI = pd.DataFrame(DoI.ewm(span = n, min_periods = n - 1).mean())  
+    RSI = 100.0 - 100.0 / (1 + (PosDI /NegDI))
+    RSI.columns = ['RSI']
+    return RSI
+
+#MACD, MACD Signal and MACD difference  
+def MACD(df, n_fast, n_slow, C_price_name='Close'):   
+    EMAfast = df[C_price_name].ewm(span = n_fast, min_periods = n_slow - 1).mean() 
+    EMAslow = df[C_price_name].ewm(span = n_slow, min_periods = n_slow - 1).mean() 
+    MACD = pd.Series(EMAfast - EMAslow, name = 'MACD_' + str(n_fast) + '_' + str(n_slow))  
+    MACDsign = pd.Series(MACD.ewm(span = 9, min_periods = 8).mean(), name = 'MACDsign_' + str(n_fast) + '_' + str(n_slow))  
+    MACDdiff = pd.Series(MACD - MACDsign, name = 'MACDdiff_' + str(n_fast) + '_' + str(n_slow))  
+    MACD = pd.concat([MACD, MACDsign, MACDdiff], axis = 1)
+
+    return MACD
+
+def performance_matrics(port_value, output = False):
+
+    #annual volatility
+    ann_vol = (port_value.pct_change().std()) * np.sqrt(252)
+    port_return = pd.DataFrame(index = port_value.index[:], columns=['Values'])
+    port_return['Values'] = port_value.pct_change()
+
+    #cumulative return series & max drawdown, max drawdown duration
+    port_cum_series= pd.DataFrame(index = port_return.index[:], 
+                                  columns=['CumulativeReturn','WaterMark','Drawdown','Dwn_Duration'])
+
+    for i in range(len(port_return)):
+        if i == 0:
+            port_cum_series['CumulativeReturn'].iloc[i] = 0
+            port_cum_series['WaterMark'].iloc[i] = port_cum_series['CumulativeReturn'].iloc[i]
+        else:
+            port_cum_series['CumulativeReturn'].iloc[i] = (1 + port_return['Values'].iloc[i]) * (1 + port_cum_series['CumulativeReturn'].iloc[i-1]) - 1
+            if port_cum_series['CumulativeReturn'].iloc[i] > port_cum_series['WaterMark'].iloc[i-1]:
+                port_cum_series['WaterMark'].iloc[i] = port_cum_series['CumulativeReturn'].iloc[i]
+            else:
+                port_cum_series['WaterMark'].iloc[i] = port_cum_series['WaterMark'].iloc[i-1]  
+
+        port_cum_series['Drawdown'].iloc[i] = ((1 + port_cum_series['WaterMark'].iloc[i]) - (1 + port_cum_series['CumulativeReturn'].iloc[i])) / (1 + port_cum_series['WaterMark'].iloc[i])
+        if i == 0:
+            port_cum_series['Dwn_Duration'].iloc[i] = 0
+        else:
+            if port_cum_series['Drawdown'].iloc[i] != 0:
+                port_cum_series['Dwn_Duration'].iloc[i] = port_cum_series['Dwn_Duration'].iloc[i-1] + 1
+            else:
+                port_cum_series['Dwn_Duration'].iloc[i] = 0 
+
+
+    max_drawdown = port_cum_series['Drawdown'].max()
+    max_dwn_duration = port_cum_series['Dwn_Duration'].max()
+    total_return = port_value.iloc[-1]/port_value.iloc[0] - 1 
+    
+    #annual return
+    ann_return = (1 + total_return) ** (1 / float((len(port_value)) / 252.0)) - 1 
+
+    #sharpe ratio
+    sharpe_ratio = (ann_return) / ann_vol
+
+    print('annual volatility:{}'.format(ann_vol.iloc[0]))
+    print('annual return:{}'.format(ann_return.iloc[0]))
+    print('sharpe ratio:{}'.format(sharpe_ratio.iloc[0]))
+    print('max drawdown:{}'.format(max_drawdown))
+    print('max down duration:{} days'.format(max_dwn_duration))
+    
+def record_transaction(symbol, action_side, date, price, quantity, fee, transaction_history):
+    '''
+    action_side: long or close
+    date: date for executing the action
+    quantity: position size
+    fee: one trip cost
+    transaction_history: record all the transaction here
+    '''
+
+    info = {
+                'Date': date,
+                'Action': action_side,
+                'Price': price,
+                'Quantity': quantity,
+                'Fee': fee
+            }
+    if symbol in transaction_history:
+        transaction_history[symbol].append(info)
+    else:
+        transaction_history.update({symbol: [info]})
+        
+        
+    return transaction_history
+
+def record_holdings(symbol, starting_point, price, shares_change, fee, holdings, target = np.nan):
+    '''
+    starting_point: date for executing the action
+    quantity: +/- position size
+    fee: one trip cost
+    holdings: record all the stock holdings info
+    target: default is "nan", or you can specify the price level you prefer 
+    '''
+    if symbol in holdings:
+        
+        if math.isnan(target):
+            target = holdings[symbol]['Target'] 
+        
+        info = {
+                'Index': starting_point,
+                'Price': price,
+                'Quantity': holdings[symbol]['Quantity'] + shares_change,
+                'Fee': fee,
+                'Target': target
+            }
+        if info['Quantity'] == 0:  #如果等於0delete掉這個symbol
+            del holdings[symbol]
+        else:
+            holdings[symbol].update(info)
+    else:
+        info = {
+                'Index': starting_point,
+                'Price': price,
+                'Quantity': shares_change,
+                'Fee': fee,
+                'Target': target
+            }
+        holdings.update({symbol: info})
+        
+        
+    return holdings
+    
+#load data and processing
+Day_PriceMat=pd.read_excel('StockPrice_set_2.xlsx', header = [0, 1])
+Day_PriceMat.fillna(method='ffill', inplace = True)
+ticker=Day_PriceMat.columns.levels[0]
+ind=Day_PriceMat.groupby(pd.Grouper(freq = 'W')).last().index
+col=pd.MultiIndex.from_product([ticker, ['Adj Open', 'Adj High', 'Adj Low', 'Adj Close']])
+PriceMat=pd.DataFrame(index=ind, columns=col)
+for symbol in ticker:
+    Price=Day_PriceMat[symbol]
+    weekly_price=Price.groupby(pd.Grouper(freq = 'W'))
+    weekly_open=weekly_price.first()[['Adj Open']]
+    weekly_high=weekly_price.max()[['Adj High']]
+    weekly_low=weekly_price.min()[['Adj Low']]
+    weekly_close=weekly_price.last()[['Adj Close']]
+    PriceMat[symbol]=pd.concat([weekly_open, weekly_high, weekly_low, weekly_close], axis = 1)
+
+#set date range
+start = datetime.datetime(2005, 1, 9)
+end = datetime.datetime(2018, 10, 14)
+#Underlyings
+#strategy parameters
+int_capital = 1000000
+pos_num = len(ticker)
+trail_up_rule = 10 #prior 10-day low
+capital_per_trade_pct = 1. / pos_num
+# squeeze
+cols=pd.MultiIndex.from_product([ticker, ['squeeze', 'Momentum']])
+cols_=pd.MultiIndex.from_product([ticker, ['Mean', 'UpperBand', 'LowerBand', '%B', 'KelChU', 'KelChM', 'KelChD']])
+squ=pd.DataFrame(index = PriceMat.index, columns = cols)
+check=pd.DataFrame(index = PriceMat.index, columns = cols_)
+for symbol in ticker:
+    squeeze, check_ = SQUEEZE(PriceMat[symbol], 20, 2, 20, 2, 'Adj High', 'Adj Low', 'Adj Close')
+    squ[symbol] = squeeze
+    check[symbol] = check_
+    
+#52 weeks high
+fifty_two_high=pd.DataFrame(index = PriceMat.index, columns = [ticker])
+for symbol in ticker:
+    high=PriceMat[symbol]
+    high_52=high['Adj High'].rolling(52).max()
+    fifty_two_high[symbol]=high_52
+
+fifty_two_high['AAL'].iloc[718,0]
+
+#交易策略
+cash_value = pd.DataFrame(data = np.zeros((len(PriceMat), 1)), index = PriceMat.index[:], columns = ['Values'])
+pos_value = pd.DataFrame(data = np.zeros((len(PriceMat), 1)), index = PriceMat.index[:], columns = ['Values'])
+total_port_value = pd.DataFrame(data = np.zeros((len(PriceMat), 1)), index = PriceMat.index[:], columns = ['Values'])
+
+# record transactions
+holding_stocks = {}
+transaction_history = {}
+
+for i in range(0, len(PriceMat)):
+    if i == 0:
+        cash_value.iloc[i, 0] = int_capital  #現價
+        total_port_value.iloc[i, 0] = cash_value.iloc[i, 0]
+    else:
+        cash_value.iloc[i, 0] = cash_value.iloc[i-1, 0]
+        for symbol in list(holding_stocks):
+            today_price = PriceMat[symbol]['Adj Close'].iloc[i] #今天持有的股票的ADJclose.
+            shares = holding_stocks[symbol]['Quantity']
+            pos_value.iloc[i, 0] += shares * today_price #position value 現在持有的價值
+        
+        #check if postion needs to exit and do the mark to market
+        if len(list(holding_stocks)) != 0:   #如果還有holdingStock
+            for symbol in list(holding_stocks):
+                today_price = PriceMat[symbol]['Adj Close'].iloc[i]
+                shares = holding_stocks[symbol]['Quantity']
+                date = PriceMat[symbol]['Adj Close'].index[i]
+                current_return = (today_price - holding_stocks[symbol]['Price']) / holding_stocks[symbol]['Price']   #當前報酬率.
+                
+                if current_return > 0:  #用前10週最低收盤價做追蹤止損
+                    trail_stop = today_price < PriceMat[symbol]['Adj Close'].iloc[i-trail_up_rule:i].min()
+                else:
+                    trail_stop = False
+                #time to exit
+                if trail_stop:
+                    cash_value.iloc[i, 0] = cash_value.iloc[i, 0] + shares * today_price
+                    pos_value.iloc[i, 0] -= shares * today_price
+                    holding_stocks = record_holdings(symbol, 0, today_price, -shares, 0, holding_stocks)
+                    transaction_history = record_transaction(symbol, 'close', date, today_price, shares, 0, transaction_history)
+                
+        total_port_value.iloc[i, 0] = pos_value.iloc[i, 0] + cash_value.iloc[i, 0]
+                
+                
+        #Add more positions 
+        if len(list(holding_stocks)) < pos_num:  #當持有的標地股票<投資配額pos_num 買入更多
+            for symbol in ticker:
+                if symbol not in list(holding_stocks): #如果不在,要準備買入
+                    #check if signal meets,買入的條件 squeeze>1 ,momentan>0
+                    cash_allocate = capital_per_trade_pct * total_port_value.iloc[i, 0]
+                    today_price = PriceMat[symbol]['Adj Close'].iloc[i]
+                    date = PriceMat[symbol]['Adj Close'].index[i]
+                    holding_cash = cash_value.iloc[i, 0]
+                    if math.isnan(fifty_two_high[symbol].iloc[i,0]) == False  and  math.isnan(squ[symbol].iloc[i,0]) == False  and  math.isnan(squ[symbol].iloc[i,1]) == False and cash_allocate <= holding_cash:
+                        if fifty_two_high[symbol].iloc[i-1,0]  < fifty_two_high[symbol].iloc[i,0] and squ[symbol].iloc[i,0] == 1 and squ[symbol].iloc[i,1]> 0 :
+                            shares = cash_allocate / today_price
+                            cash_value.iloc[i, 0] = holding_cash - cash_allocate
+                            pos_value.iloc[i, 0] += cash_allocate
+                            holding_stocks = record_holdings(symbol, i, today_price, shares, 0, holding_stocks)
+                            transaction_history = record_transaction(symbol, 'long', date, today_price, shares, 0, transaction_history)
+                else:
+                    continue
+    
+    #update total value of portfolio 
+    total_port_value.iloc[i, 0] = pos_value.iloc[i, 0] + cash_value.iloc[i, 0]
+    
+#交易紀錄
+transaction_history
+#總資產變化
+total_port_value.iloc[:, 0].plot(figsize= (20, 10), title = 'Portfolio Value', fontsize = 20, grid = True)
+#現金變化
+cash_value.iloc[:, 0].plot(figsize= (20, 10), title = 'Cash Value', fontsize = 20, grid = True)
+#績效表現
+performance_matrics(total_port_value)
+
+# BENCHMARK
+# load data
+Benchmark = pd.read_excel('Benchmark.xlsx', index_col = 0)
+benchmark_value = pd.DataFrame(data = np.zeros((len(Benchmark), 1)), index = Benchmark.index[:], columns = ['Values'])
+for i in range(0, len(benchmark_value)):
+    if i == 0:
+        benchmark_value.iloc[i, 0] = int_capital
+        benchshare = int_capital / Benchmark.iloc[i, 0]
+    else:
+        benchmark_value.iloc[i, 0] = benchshare * Benchmark.iloc[i, 0]
+benchmark_value
+# benchmark 績效
+performance_matrics(benchmark_value)
